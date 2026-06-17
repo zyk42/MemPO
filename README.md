@@ -19,13 +19,6 @@ MemPO introduces a lightweight **PromptMemoryBank** that maintains per-prompt ex
 - **Mastery Filter**: Zero-gradient protection when EMA mean exceeds τ = (n-1)/n, preventing harmful updates on mastered content
 - **No Std Normalization**: Following Dr. GRPO, advantage = r - μ_EMA (no division by std), reducing baseline variance ~10x
 
-## Results
-
-On MATH-500 with Qwen3-1.7B:
-- **+2.87% pass@1** over standard GRPO
-- **Forgetting collapse entirely eliminated** on GSM8K (+0.79% pass@1)
-- Consistent improvements across Qwen2.5-Math-7B and Qwen3-8B
-
 ## Repository Structure
 
 ```
@@ -110,16 +103,6 @@ When the updated EMA mean μ_t > τ = (n-1)/n:
 ### Pre-initialization
 
 Before training, runs a no-grad rollout pass over all training prompts to initialize μ₀, eliminating cold-start artifacts.
-
-## Citation
-
-```bibtex
-@article{mempo2025,
-  title={Mitigating Catastrophic Forgetting in GRPO via Cross-Step EMA Normalization and Mastery Filtering},
-  author={Anonymous},
-  year={2025}
-}
-```
 
 ## License
 
