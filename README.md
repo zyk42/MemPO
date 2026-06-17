@@ -26,35 +26,66 @@ On MATH-500 with Qwen3-1.7B:
 - **Forgetting collapse entirely eliminated** on GSM8K (+0.79% pass@1)
 - Consistent improvements across Qwen2.5-Math-7B and Qwen3-8B
 
-## Architecture
+## Repository Structure
 
 ```
-src/
-├── prompt_memory_bank.py     # Core: per-prompt EMA statistics bank
-└── degradation_sampler.py    # Optional: degradation-aware replay sampling
+verl/                                    # Modified verl framework source (for reproduction)
+├── verl/trainer/ppo/core_algos.py       # EMA_GRPO advantage estimator
+├── verl/trainer/ppo/ray_trainer.py      # Memory bank lifecycle & pre-init
+├── verl/trainer/config/algorithm.py     # AlgoConfig with EMA-GRPO fields
+├── verl/trainer/config/ppo_trainer.yaml # Default YAML config
+├── verl/trainer/main_ppo.py             # Training entry point
+├── verl/utils/prompt_memory_bank.py     # Core: per-prompt EMA statistics bank
+├── verl/experimental/dataset/
+│   ├── sampler.py                       # AbstractCurriculumSampler interface
+│   └── degradation_sampler.py           # Degradation-aware replay sampling
+└── examples/
+    ├── data_preprocess/                 # Dataset preparation scripts
+    └── grpo_trainer/                    # Example training scripts
 
-tools/
-├── precompute_memory_bank.py # Pre-init memory bank with base model rollouts
-├── eval_passk_final.py       # Pass@k evaluation with vLLM
-├── compare_experiments.py    # Cross-experiment comparison utility
+src/                                     # Standalone copies (for quick reference)
+├── prompt_memory_bank.py
+└── degradation_sampler.py
+
+tools/                                   # Utilities
+├── precompute_memory_bank.py            # Pre-init memory bank with base model
+├── eval_passk_final.py                  # Pass@k evaluation with vLLM
+├── compare_experiments.py               # Cross-experiment comparison
+├── merge_lora_direct.py                 # LoRA merge utility
 └── ...
 
-eval_results/                 # Experiment results (JSON/text)
-reports/                      # Detailed experiment reports
-fig_data/                     # Training curves and visualization data
+run_*.sh                                 # Training scripts (various models/configs)
+eval_*.sh                                # Evaluation scripts
+eval_results/                            # Experiment results (JSON)
+reports/                                 # Detailed experiment reports
+fig_data/                                # Training curves and visualization data
+paper.tex                                # Paper draft
 ```
 
-## Quick Start
+## Reproduction
 
-### Integration with verl
+### Prerequisites
 
-MemPO is implemented as a plugin for the [verl](https://github.com/volcengine/verl) framework. Key modifications:
+1. Install [verl](https://github.com/volcengine/verl) framework
+2. Replace/patch the files in `verl/` directory into your verl installation:
+   ```bash
+   # Option A: Copy modified files over your verl installation
+   cp -r verl/verl/* /path/to/your/verl/verl/
+   
+   # Option B: Or simply use this repo as the verl source
+   cd verl && pip install -e .
+   ```
+3. Prepare dataset with `index` field in `extra_info`:
+   ```python
+   # Each row's extra_info must contain: {"index": <int>, "split": "train"}
+   python verl/examples/data_preprocess/math_dataset.py
+   ```
 
-1. **New advantage estimator**: `algorithm.adv_estimator=ema_grpo` in `verl/trainer/ppo/core_algos.py`
-2. **Memory bank lifecycle**: Initialized in `ray_trainer.py`, persisted with checkpoints
-3. **Config additions**: `verl/trainer/config/algorithm.py` and `ppo_trainer.yaml`
+### Quick Start
 
-See [verl_modifications_current.md](verl_modifications_current.md) for complete integration details.
+MemPO is implemented as a modification to the [verl](https://github.com/volcengine/verl) framework. The complete modified source is in the `verl/` directory.
+
+See [verl_modifications_current.md](verl_modifications_current.md) for detailed integration documentation.
 
 ### Training
 
