@@ -1,0 +1,46 @@
+{
+  "original": {
+    "train": 0.5825,
+    "test": 0.62
+  },
+  "baseline_step400": {
+    "train": 0.5825,
+    "test": 0.62
+  },
+  "baseline_step480": {
+    "train": 0.5825,
+    "test": 0.62
+  },
+  "phase2_g2.0_step400": {
+    "train": 0.58,
+    "test": 0.62
+  },
+  "phase2_g2.0_step480": {
+    "train": 0.5775,
+    "test": 0.62
+  },
+  "phase3_g0.0_step400": {
+    "train": 0.5775,
+    "test": 0.62
+  },
+  "phase3_g0.0_step480": {
+    "train": 0.58,
+    "test": 0.62
+  },
+  "phase4_g0.5_step400": {
+    "train": 0.5825,
+    "test": 0.62
+  },
+  "phase4_g0.5_step480": {
+    "train": 0.5775,
+    "test": 0.62
+  },
+  "phase4_g1.0_step400": {
+    "train": 0.5725,
+    "test": 0.62
+  },
+  "phase4_g1.0_step480": {
+    "train": 0.5675,
+    "test": 0.62
+  }
+}

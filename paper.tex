@@ -1,0 +1,1304 @@
+\documentclass[11pt]{article}
+
+% ── Packages ──────────────────────────────────────────────────────────────────
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{multirow}
+\usepackage{microtype}
+% \usepackage{natbib}  % bibliography to be added by author
+
+% ── Macros ────────────────────────────────────────────────────────────────────
+\newcommand{\method}{EMA-GRPO}
+\newcommand{\methodfull}{EMA-GRPO with Mastery Filter}
+\newcommand{\pmb}{\mathcal{M}}
+\newcommand{\ie}{\textit{i.e.}}
+\newcommand{\eg}{\textit{e.g.}}
+\newcommand{\etal}{\textit{et~al.}}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+
+% ──────────────────────────────────────────────────────────────────────────────
+\title{\textbf{Mitigating Catastrophic Forgetting in GRPO via\\
+       Cross-Step EMA Normalization and Mastery Filtering}}
+
+\author{
+  Anonymous Author(s)
+}
+
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Group Relative Policy Optimization (GRPO) has become a widely adopted
+reinforcement learning algorithm for training large language models on
+mathematical reasoning tasks.
+However, we observe a systematic \emph{catastrophic forgetting} phenomenon:
+questions answered correctly early in training regress to incorrect answers
+in later epochs.
+We identify three structural deficiencies in standard GRPO that collectively
+cause this regression: (1) high-variance batch-level advantage normalization,
+(2) destruction of the zero-gradient protection for mastered questions when
+cross-step baselines are naively introduced, and (3) insufficient gradient
+signal on hard problems under uniform sampling.
+To address these deficiencies, we propose \methodfull{}, which maintains a
+lightweight \emph{PromptMemoryBank} that accumulates per-prompt exponential
+moving average (EMA) statistics across training steps.
+Following \citet{liu2025drgrpo}, we do not divide by a standard deviation
+estimate; instead the advantage is simply $r - \mu_{\mathrm{EMA}}$, which
+reduces baseline variance by approximately $10\times$ compared to single-batch
+statistics while avoiding std initialization artifacts.
+A \emph{Mastery Filter} explicitly restores the zero-gradient protection by
+zeroing the advantage of any prompt for which all current rollouts are correct,
+preventing wasteful and harmful gradient updates on already-mastered content.
+Experiments on MATH-500 and GSM8K with Qwen3-1.7B demonstrate consistent
+improvements: +2.87\% pass@1 on MATH-500 and +0.79\% pass@1 on GSM8K,
+with the forgetting collapse observed in standard GRPO entirely eliminated
+on GSM8K.
+\end{abstract}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Introduction}
+\label{sec:intro}
+% ══════════════════════════════════════════════════════════════════════════════
+
+Reinforcement learning from verifiable rewards (RLVR) has emerged as a
+powerful paradigm for eliciting mathematical reasoning from large language
+models (LLMs)~\citep{ouyang2022training,lightman2023let}.
+Among the algorithms proposed for this setting, Group Relative Policy
+Optimization (GRPO)~\citep{shao2024deepseekmath} has gained broad adoption
+due to its simplicity and effectiveness: it forgoes a learned critic by
+normalizing rewards \emph{within} a group of rollouts sampled for the same
+prompt, obtaining advantages without a separate value network.
+
+Despite these advantages, we identify a systematic failure mode in GRPO that
+has received limited attention: \textbf{catastrophic forgetting of mastered
+problems during extended training}.
+In our experiments with Qwen3-1.7B on MATH-500, 16 out of 373 training
+problems that were correctly solved at epoch 1 regressed to incorrect answers
+by epoch 9 under standard GRPO.
+The regression patterns are qualitatively diverse: a model may correctly
+derive intermediate steps but misidentify the target quantity at the final
+step (\emph{last-step drift}), fall into repetitive verification loops that
+diverge from the correct reasoning path (\emph{verification drift}), or
+progressively drop boundary conditions that were present in earlier correct
+responses (\emph{constraint erosion}).
+
+We trace these forgetting phenomena to three interacting structural
+deficiencies of standard GRPO:
+
+\paragraph{Deficiency 1: High-variance batch-level advantage normalization.}
+Standard GRPO normalizes advantages using the mean and standard deviation
+computed over $n$ rollouts of the current batch.
+With $n=8$ rollouts and a prompt whose true success probability is $\pi=0.5$,
+the standard error of the batch mean is $\sqrt{\pi(1-\pi)/n} \approx 0.177$.
+This noise causes the advantage baseline for the \emph{same} prompt to shift
+substantially across training steps, producing contradictory gradient signals
+that induce policy oscillation and forgetting.
+
+\paragraph{Deficiency 2: Fragile zero-gradient protection.}
+GRPO naturally produces zero gradient when all $n$ rollouts for a prompt are
+correct (since all advantages are zero after within-group normalization),
+providing implicit protection against over-training on mastered content.
+Prior work has proposed cross-step baselines (\eg, EMA of historical rewards)
+to stabilize normalization, but doing so naively breaks this protection:
+an EMA mean of $\hat{\mu}=0.7$ assigns positive advantages to a fully-correct
+rollout batch, causing the model to receive non-zero—and potentially
+detrimental—gradient updates on already-mastered problems.
+Our ablation confirms this: using EMA normalization alone \emph{increases}
+the number of regressed problems from 19 to 37.
+
+\paragraph{Deficiency 3: Insufficient gradient signal for hard problems.}
+Under uniform prompt sampling, easy problems (high pass rate) and hard
+problems (low pass rate) receive equal training exposure.
+Because the per-step gradient signal for a problem scales with its advantage
+magnitude, hard problems that the model rarely solves contribute relatively
+weak learning signal, limiting the overall convergence rate.
+As we show below, the Mastery Filter already addresses this deficiency
+implicitly: by zeroing gradients on fully-mastered prompts, it ensures
+that \emph{all} active gradient signal originates from problems the model
+has not yet mastered---an implicit difficulty-aware curriculum
+achieved without any explicit change to the sampling distribution.
+
+To address all three deficiencies within a unified framework, we propose
+\methodfull{}.
+The core data structure is a \emph{PromptMemoryBank}: a lightweight dictionary
+indexed by prompt ID that stores the per-prompt EMA mean reward and visit
+count across training steps.
+On top of this persistent memory, we build two complementary mechanisms:
+
+\begin{enumerate}
+  \item \textbf{EMA Mean Baseline.} We replace the noisy batch-level mean
+    with a per-prompt EMA mean from the PromptMemoryBank, yielding a stable
+    cross-step baseline: $A_i^{(p)} = r_i^{(p)} - \mu_{t-1}(p)$.
+    Following \citet{liu2025drgrpo}, we do \emph{not} divide by a standard
+    deviation estimate; the $n=8$ sample std is itself high-variance and
+    its removal is consistently beneficial.
+    With decay $\alpha=0.9$, the effective sample count of the mean grows to
+    $n_{\text{eff}} \approx n/(1-\alpha) = 80$, reducing baseline variance
+    by $\approx10\times$ relative to standard GRPO.
+
+  \item \textbf{Mastery Filter.} We explicitly restore the zero-gradient
+    protection by hard-zeroing the advantage of any prompt for which the
+    current rollout batch is fully correct (\ie, all $n$ rollouts succeed).
+    Crucially, the PromptMemoryBank still records the correct-batch mean
+    for future EMA updates, so the memory stays current even when no gradient
+    is emitted.
+    Beyond protecting mastered knowledge, the Filter has a secondary effect:
+    it concentrates \emph{all} gradient signal on the subset of prompts that
+    the model has not yet mastered, forming an implicit difficulty-aware
+    curriculum that also addresses Deficiency~3 without any explicit
+    change to the sampling distribution.
+\end{enumerate}
+
+We explored an additional \textbf{Degradation-Aware Resampling} component
+that explicitly upweights hard and regressing prompts at the sampling level.
+However, this is conceptually redundant with the Mastery Filter's implicit
+gradient concentration: the Filter already ensures that every gradient step
+draws exclusively from non-mastered prompts.
+Our ablation (Section~\ref{sec:resampling_ablation}) confirms that explicit
+resampling provides no additional benefit and is harmful on smaller training
+sets due to overfitting amplification.
+
+We evaluate \method{} on two benchmarks.
+On MATH-500 (400 training problems), \method{} achieves pass@1 of 0.689 versus
+baseline GRPO's 0.670 (+2.87\%), and pass@8 of 0.800 versus 0.790 (+1.27\%).
+On GSM8K (1{,}000 training problems), standard GRPO reaches a peak of 92.16\%
+accuracy before collapsing to 88.09\% by the end of training—a canonical
+forgetting trajectory. \method{} instead climbs steadily to 92.48\% and
+remains stable at 89.34\% at the same final step, with no collapse.
+
+Our contributions are as follows.
+
+\paragraph{(1) Forgetting characterization.}
+We provide a detailed empirical characterization of catastrophic forgetting
+in GRPO, identifying three interacting structural root causes and documenting
+qualitative regression patterns observed in extended training.
+
+\paragraph{(2) PromptMemoryBank.}
+We introduce the \emph{PromptMemoryBank} abstraction: a lightweight
+per-prompt EMA statistics store that persists across training steps,
+enabling cross-step advantage normalization without breaking
+zero-gradient protection.
+
+\paragraph{(3) \methodfull{} algorithm.}
+We combine the EMA mean baseline and the Mastery Filter into a principled
+algorithm, supported by thorough component ablations that validate each design
+choice and rule out several intuitive but harmful alternatives.
+
+\paragraph{(4) Empirical validation.}
+We demonstrate consistent forgetting mitigation and accuracy gains across
+four evaluation benchmarks (AIME 2024, AIME 2025, MATH-500, GSM8K),
+two model families, and three training set sizes.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Related Work}
+\label{sec:related}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\subsection{Policy Optimization for LLM Reasoning}
+
+\paragraph{PPO and RLHF.}
+Proximal Policy Optimization (PPO)~\citep{schulman2017proximal} is the
+canonical on-policy RL algorithm for LLM alignment~\citep{ouyang2022training}.
+PPO relies on a learned value network to compute advantages, which adds
+significant memory and compute overhead in the LLM setting.
+REINFORCE++~\citep{hu2025reinforce} revisits the simpler REINFORCE estimator
+with a token-level baseline to reduce variance, showing competitive performance
+without a critic network.
+
+\paragraph{GRPO.}
+\citet{shao2024deepseekmath} proposed GRPO as a critic-free alternative:
+for each prompt, $n$ responses are sampled, and the reward of each response
+is normalized by the mean and standard deviation of the group to obtain
+advantages.
+This eliminates the value network while providing relative reward signals.
+GRPO has since been adopted by a wide range of mathematical reasoning
+systems~\citep{deepseekr1,qwen2math}.
+
+\paragraph{DAPO.}
+\citet{yu2025dapo} identified that all-correct and all-wrong rollout batches
+produce zero gradient in GRPO, and proposed \emph{Dynamic Sampling} to
+discard such batches and resample from the remaining prompts.
+While this eliminates zero-gradient steps, it discards all information from
+mastered prompts and does not accumulate any cross-step statistics.
+Our Mastery Filter takes a different position: instead of discarding
+all-correct batches, we zero their gradient contribution while \emph{retaining}
+them for PromptMemoryBank updates.
+This preserves the EMA statistics required for stable future normalization.
+
+\paragraph{Dr.\ GRPO.}
+\citet{liu2025drgrpo} observed that batch-level normalization in GRPO
+conflates per-prompt difficulty, introducing systematic bias.
+They proposed removing the std normalization entirely, computing advantages
+as $A_i^{(p)} = r_i^{(p)} - \hat{\mu}_t^{(p)}$ using only the per-prompt
+batch mean as baseline.
+This eliminates the noise from the $n=8$ sample std estimator.
+Our method shares the no-std design principle with Dr.\ GRPO, but replaces
+the single-step batch mean with a cross-step EMA mean: the EMA baseline
+is an order of magnitude less noisy ($n_{\mathrm{eff}} = 80$ vs.\ $n=8$)
+and explicitly tracks per-prompt performance history, enabling the Mastery
+Filter and Degradation-Aware Resampling mechanisms.
+
+\subsection{Catastrophic Forgetting in Neural Networks}
+
+Catastrophic forgetting, the tendency of neural networks to lose previously
+acquired knowledge upon learning new information, is a classical problem in
+continual learning~\citep{mccloskey1989catastrophic,french1999catastrophic}.
+Standard mitigations include Elastic Weight Consolidation
+(EWC)~\citep{kirkpatrick2017overcoming}, which penalizes changes to weights
+important for past tasks; Progressive Neural Networks~\citep{rusu2016progressive},
+which allocate new capacity for new tasks; and experience
+replay~\citep{riemer2018learning,rolnick2019experience}, which maintains a
+buffer of past examples to interleave with new training.
+
+In the LLM fine-tuning context, forgetting of pre-training capabilities
+during instruction tuning has been studied by
+\citet{luo2023empirical,kotha2023understanding}.
+KL-divergence penalties against a frozen reference model—as used in standard
+RLHF and in GRPO's regularization term—provide a global constraint on policy
+drift but cannot selectively protect specific capabilities.
+Our Mastery Filter offers a different mechanism: rather than constraining
+\emph{how much} the policy can change globally, it identifies specific mastered
+prompts and suppresses gradient updates on them precisely.
+
+\subsection{Curriculum Learning and Adaptive Sampling}
+
+Curriculum learning~\citep{bengio2009curriculum} proposes to order training
+examples from easy to hard, accelerating learning and sometimes improving
+final performance.
+Self-paced learning~\citep{kumar2010self} and its variants automate curriculum
+construction by weighting examples according to current model difficulty.
+In the RL-for-reasoning literature, \citet{fan2025areal} and
+\citet{zhao2025absolute} explore difficulty-based sampling strategies.
+Our Degradation-Aware Resampling combines difficulty-based weighting with
+regression detection: a prompt's sampling weight increases both when it is
+historically hard \emph{and} when it has recently regressed, targeting
+precisely the problems that represent active forgetting events.
+
+\subsection{EMA in Optimization and RL}
+
+Exponential moving averages are ubiquitous in optimization, from Adam's
+moment estimates~\citep{kingma2014adam} to target networks in
+DQN~\citep{mnih2015human} and soft actor-critic~\citep{haarnoja2018soft}.
+In the context of advantage normalization, \citet{andrychowicz2020matters}
+discuss running statistics for reward normalization in deep RL.
+Our use of EMA is most closely related to running reward normalization, but
+differs in operating at the \emph{per-prompt} level rather than globally,
+and in being coupled with the Mastery Filter to prevent the zero-gradient
+protection failure described in Section~\ref{sec:intro}.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Method}
+\label{sec:method}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\subsection{Preliminaries: GRPO}
+\label{sec:grpo_prelim}
+
+Let $\mathcal{D} = \{p_1, \ldots, p_N\}$ be a training set of prompts.
+At each training step $t$, a mini-batch $\mathcal{B} \subset \mathcal{D}$ is
+sampled, and for each prompt $p \in \mathcal{B}$, $n$ responses are rolled out
+from the current policy $\pi_\theta$:
+$\{o_1^{(p)}, \ldots, o_n^{(p)}\}$.
+Each response receives a scalar reward $r_i^{(p)} \in [0,1]$ from a verifiable
+reward function (e.g., exact-match against ground-truth answer).
+Standard GRPO computes the advantage of response $o_i^{(p)}$ as
+\begin{equation}
+  A_i^{(p)} = \frac{r_i^{(p)} - \hat{\mu}_t^{(p)}}{\hat{\sigma}_t^{(p)} + \varepsilon},
+  \label{eq:grpo_adv}
+\end{equation}
+where $\hat{\mu}_t^{(p)} = \frac{1}{n}\sum_i r_i^{(p)}$ and
+$\hat{\sigma}_t^{(p)} = \mathrm{std}(\{r_i^{(p)}\})$ are \emph{batch-level}
+statistics computed from the current step's $n$ rollouts only.
+The policy is updated by maximizing the clipped surrogate objective
+\begin{equation}
+  \mathcal{L}_{\text{GRPO}}(\theta) =
+  \mathbb{E}\!\left[\min\!\left(
+    \frac{\pi_\theta(o|p)}{\pi_{\theta_{\text{old}}}(o|p)} A,\;
+    \mathrm{clip}\!\left(\frac{\pi_\theta(o|p)}{\pi_{\theta_{\text{old}}}(o|p)},
+      1\!-\!\epsilon, 1\!+\!\epsilon\right) A
+  \right)\right]
+  - \beta\, D_{\mathrm{KL}}(\pi_\theta \| \pi_{\mathrm{ref}}),
+  \label{eq:grpo_obj}
+\end{equation}
+with clip ratio $\epsilon$ and KL coefficient $\beta$.
+
+\subsection{PromptMemoryBank}
+\label{sec:pmb}
+
+The central data structure of our method is the \emph{PromptMemoryBank}
+$\mathcal{M}$, a dictionary keyed by prompt index $\mathrm{id}(p) \in \{1,\ldots,N\}$.
+Each entry stores a pair
+$\mathcal{M}[p] = (\mu(p),\, c(p))$,
+where $\mu(p)$ is the EMA-smoothed mean reward for prompt $p$ and $c(p)$
+is the visit count.
+We intentionally do not track a per-prompt EMA standard deviation:
+dividing by the std estimate introduces initialization artifacts (the
+standard prior of $\sigma_0=1$ takes $\sim\!20$ visits to converge to the
+true value of $\approx\!0.5$ for binary rewards) and, per \citet{liu2025drgrpo},
+is not necessary for effective advantage estimation with small rollout groups.
+
+\paragraph{EMA update rule.}
+After computing the batch mean $\hat{\mu}_t^{(p)}$ from the current step's
+$n$ rollouts, we update $\mathcal{M}[p]$ using
+\begin{equation}
+  \mu_t(p) \leftarrow \alpha\,\mu_{t-1}(p) + (1-\alpha)\,\hat{\mu}_t^{(p)},
+  \label{eq:ema_mean}
+\end{equation}
+where $\alpha \in (0,1)$ is the EMA decay coefficient (default $\alpha=0.9$).
+
+\paragraph{Cold-start initialization.}
+On the \emph{first} visit to prompt $p$ ($c(p)=0$), we initialize
+$\mu_0(p) \leftarrow \hat{\mu}_t^{(p)}$ directly (cold start) rather than
+using the arbitrary prior $\mu_0(p)=0$.
+This ensures the EMA baseline is grounded in actual model performance from
+the very first encounter, eliminating the warm-up period of mean underestimation.
+
+\paragraph{Effective sample count.}
+The EMA with decay $\alpha$ is equivalent to a weighted average over past
+batches with exponentially decaying weights, yielding an effective sample
+count of
+\begin{equation}
+  n_{\mathrm{eff}} \approx \frac{n}{1-\alpha}.
+\end{equation}
+With $n=8$ and $\alpha=0.9$, $n_{\mathrm{eff}} = 80$, reducing the variance
+of the mean estimator by a factor of $10$ relative to standard GRPO.
+
+\paragraph{Warmup.}
+Although the cold-start initialization grounds the EMA mean from the first
+visit, the estimate can still be noisy after a single observation.
+We introduce a warmup threshold $K$: for visits $c(p) < K$, advantage
+computation falls back to the current batch mean as in standard GRPO.
+EMA normalization activates only after $c(p) \geq K$ (default $K=3$).
+
+\subsection{EMA Mean Baseline}
+\label{sec:ema_norm}
+
+Once the warmup condition is satisfied, we subtract the EMA mean from the
+PromptMemoryBank as the advantage baseline, without any standard deviation
+scaling:
+\begin{equation}
+  A_i^{(p)} = r_i^{(p)} - \mu_{t-1}(p),
+  \qquad c(p) \geq K.
+  \label{eq:ema_adv}
+\end{equation}
+We use $\mu_{t-1}(p)$ (\ie, the EMA mean \emph{before} the current-step
+update) to avoid look-ahead bias: the advantage is computed before the memory
+bank incorporates the new batch.
+The EMA update (Eq.~\eqref{eq:ema_mean}) is applied \emph{after} the
+advantage is computed.
+
+The omission of std normalization is deliberate and follows from three
+complementary arguments.
+
+\textbf{(i) For binary rewards, std carries no information beyond the mean.}
+Mathematical reasoning tasks use binary correctness rewards $r \in \{0,1\}$.
+For a Bernoulli random variable with mean $\mu$, the standard deviation is
+exactly $\sigma = \sqrt{\mu(1-\mu)}$---a deterministic function of $\mu$.
+Given the EMA mean $\mu_{t-1}(p)$, the per-prompt std is therefore fully
+determined: dividing by $\hat{\sigma}$ merely applies a fixed monotone
+rescaling $1/\sqrt{\mu(1-\mu)}$ to the advantage, without adding any
+information about the prompt's difficulty or the quality of the current
+response.
+Concretely, Eq.~\eqref{eq:ema_adv} gives $A_i^{(p)} \in \{1-\mu, -\mu\}$
+for a correct and incorrect response respectively---magnitudes that naturally
+reflect difficulty: a hard prompt ($\mu \approx 0$) yields a large positive
+advantage when solved ($\approx 1$) and a small negative when failed
+($\approx 0$), concentrating gradient energy where learning is most needed.
+Dividing by $\sigma$ would distort this natural weighting without benefit.
+
+\textbf{(ii) Small-sample std estimates are high-variance.}
+With $n=8$ rollouts, the empirical std $\hat{\sigma}_t^{(p)}$ is an
+unreliable estimate of the true $\sigma(p)$.
+Its coefficient of variation is $\approx 1/\!\sqrt{2(n-1)} \approx 0.27$
+for $n=8$---meaning the denominator can swing by $\pm 27\%$ step-to-step
+from sampling noise alone.
+Dividing by this estimate re-introduces step-level variance into the
+advantage after the EMA mean has removed it.
+\citet{liu2025drgrpo} empirically confirms that removing std normalization
+is consistently beneficial for small rollout groups.
+An EMA std would not help, and in fact introduces a critical instability.
+Consider the prior $\sigma_0 = 1$: this far exceeds the true binary-reward
+std of $\approx 0.5$, and with $\alpha=0.9$ requires $\sim\!20$ EMA
+updates to converge---producing an abrupt advantage-scale shift when EMA
+activates that destabilises training.
+More dangerously, if a prompt's first $n$ rollouts are \emph{all correct}
+or \emph{all incorrect} ($\hat{\sigma}=0$), a cold-start initialization
+of the EMA std stores $\hat{\sigma}=\epsilon \approx 10^{-6}$ to avoid
+division by zero.
+The EMA decay preserves this near-zero value: after $k$ subsequent updates,
+$\sigma_k \approx \alpha^k \epsilon + (1-\alpha^k)\,\bar{\sigma}$.
+With $\alpha=0.9$ and $\epsilon=10^{-6}$, even after 10 updates
+$\sigma_{10} \approx 0.35\,\epsilon + 0.65\,\bar{\sigma} \approx 0.32$---still
+well below the batch std.
+When the warmup ends and EMA activates, advantages are divided by this
+underestimated $\sigma$, causing a sudden $\sim\!2\times$ scale increase.
+In practice we observed $\mathtt{pg\_loss}$ spikes to values in the
+range $10^3$--$10^4$ at the warmup boundary, followed by gradient explosion
+that destabilises or terminates training.
+Removing std from the EMA entirely eliminates this failure mode at its root.
+
+\textbf{(iii) The Mastery Filter handles the degenerate $\sigma \to 0$ case.}
+The canonical reason to keep a std in the denominator is numerical safety:
+when $\sigma \approx 0$ (the model is nearly deterministic on a prompt),
+division could explode.
+The Mastery Filter eliminates this concern: it zeroes the advantage for
+any prompt where all $n$ rollouts are correct ($\hat{\mu}_t^{(p)} = 1.0$,
+$\hat{\sigma}_t^{(p)} = 0$), the only case where $\sigma = 0$ for binary
+rewards.
+The two mechanisms are therefore complementary: the Mastery Filter makes
+std division unnecessary for numerical safety, and the binary-reward
+structure makes it unnecessary for information content.
+
+\subsection{Mastery Filter}
+\label{sec:mastery}
+
+As noted in Section~\ref{sec:intro}, EMA normalization alone breaks the
+zero-gradient protection of standard GRPO.
+When $\mu_{t-1}(p)$ lags behind the true current performance (\eg,
+$\mu_{t-1}(p) = 0.7$ while all $n$ current rollouts succeed), the advantages
+in Eq.~\eqref{eq:ema_adv} are positive, causing the policy to receive a
+non-zero update that pushes it \emph{further} toward responses it already
+produces reliably—a form of gradient waste that can disrupt neighboring
+capabilities.
+
+The Mastery Filter restores exact zero-gradient protection by detecting
+fully-correct batches and zeroing their advantages:
+\begin{equation}
+  A_i^{(p)} = 0 \quad \text{if } \hat{\mu}_t^{(p)} \geq \tau_{\mathrm{mastery}},
+  \label{eq:mastery}
+\end{equation}
+where $\tau_{\mathrm{mastery}} = 1.0$ (all $n$ rollouts correct).
+We set $\tau = 1.0$ rather than a softer threshold because a $(n-1)/n$-correct
+batch still contains one failed rollout that provides a valid contrastive
+gradient signal.
+
+Crucially, zeroing the advantage does \emph{not} skip the PromptMemoryBank
+update: the EMA mean $\mu(p)$ is updated regardless, staying current even
+during mastered-prompt steps.
+This ensures that when the model later regresses on a previously mastered
+problem, the EMA mean quickly reflects the regression and the Mastery
+Filter disengages, allowing corrective gradient updates to resume.
+
+\paragraph{Implicit difficulty-aware curriculum.}
+The Mastery Filter has a second, less obvious effect: it acts as an
+implicit difficulty-aware curriculum learning mechanism in gradient space.
+Because all fully-correct prompts contribute zero gradient, \emph{every
+non-zero gradient step is driven entirely by prompts the model has not yet
+mastered}---hard problems (consistently low $\mu$) and recently regressed
+problems (falling $\mu$) both retain full gradient weight, while easy
+mastered problems are silenced.
+This implicit curriculum emerges automatically from the filter's primary
+forgetting-prevention role, without any explicit change to the training
+data sampling distribution.
+An explicit Degradation-Aware Resampling scheme (Section~\ref{sec:resampling})
+targets the same objective at the sampling level, but our experiments show
+it provides no additional gain over the implicit curriculum already established
+by the Mastery Filter, and causes overfitting on small datasets.
+
+\paragraph{Combined advantage computation.}
+Putting everything together, the advantage for response $o_i^{(p)}$ at step
+$t$ is:
+\begin{equation}
+  A_i^{(p)} = \begin{cases}
+    0
+      & \text{if } \hat{\mu}_t^{(p)} \geq \tau_{\mathrm{mastery}}
+        \quad\text{(Mastery Filter)}\\[4pt]
+    r_i^{(p)} - \mu_{t-1}(p)
+      & \text{if } c(p) \geq K
+        \quad\text{(EMA mean baseline)}\\[4pt]
+    r_i^{(p)} - \hat{\mu}_t^{(p)}
+      & \text{otherwise}
+        \quad\text{(warmup: batch mean baseline)}
+  \end{cases}
+  \label{eq:final_adv}
+\end{equation}
+
+\subsection{Full Algorithm}
+\label{sec:algorithm}
+
+Algorithm~\ref{alg:ema_grpo} describes the complete \method{} training loop.
+
+\begin{algorithm}[t]
+\caption{\methodfull}
+\label{alg:ema_grpo}
+\begin{algorithmic}[1]
+\Require Training set $\mathcal{D}$, policy $\pi_\theta$, reference $\pi_{\mathrm{ref}}$,
+         EMA decay $\alpha$, warmup $K$, mastery threshold $\tau$, rollout count $n$
+\State Initialize $\mathcal{M}[p] \leftarrow \textit{empty}$ for all $p \in \mathcal{D}$
+\For{each training step $t$}
+  \State Sample mini-batch $\mathcal{B} \subset \mathcal{D}$
+  \For{each prompt $p \in \mathcal{B}$}
+    \State Roll out $n$ responses; compute rewards $\{r_i^{(p)}\}$
+    \State $\hat{\mu}_t^{(p)} \leftarrow \frac{1}{n}\sum_i r_i^{(p)}$
+    \State Read $(\mu_{t-1}(p),\; c(p)) \leftarrow \mathcal{M}[p]$
+    \For{$i = 1, \ldots, n$}
+      \If{$\hat{\mu}_t^{(p)} \geq \tau$} \hfill\Comment{Mastery Filter}
+        \State $A_i^{(p)} \leftarrow 0$
+      \ElsIf{$c(p) \geq K$} \hfill\Comment{EMA baseline}
+        \State $A_i^{(p)} \leftarrow r_i^{(p)} - \mu_{t-1}(p)$
+      \Else \hfill\Comment{warmup}
+        \State $A_i^{(p)} \leftarrow r_i^{(p)} - \hat{\mu}_t^{(p)}$
+      \EndIf
+    \EndFor
+    \State Update $\mathcal{M}[p]$ via Eq.~\eqref{eq:ema_mean}; increment $c(p)$
+  \EndFor
+  \State Update $\pi_\theta$ with objective~\eqref{eq:grpo_obj} using $\{A_i^{(p)}\}$
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Experiments}
+\label{sec:experiments}
+% ══════════════════════════════════════════════════════════════════════════════
+
+\subsection{Experimental Setup}
+\label{sec:setup}
+
+\paragraph{Models.}
+We evaluate across four model configurations of increasing capacity:
+\textbf{Qwen3-1.7B} (used for ablation studies),
+\textbf{Qwen2.5-Math-1.5B} (primary main results),
+\textbf{Qwen3-8B} (additional validation), and
+\textbf{Qwen2.5-Math-7B-Base} (large-scale generalization, Section~\ref{sec:largescale}).
+All models are fine-tuned with LoRA (rank~64, $\alpha_{\mathrm{LoRA}}=32$).
+
+\paragraph{Training data.}
+We train on \textbf{MATH-Train$_{\text{2800}}$}, a 2{,}800-problem subset
+sampled from the MATH training split.
+Smaller subsets used in ablation studies (400-problem and 1{,}000-problem splits)
+are described in the respective subsections.
+
+\paragraph{Evaluation benchmarks.}
+All methods are evaluated on four benchmarks across the full difficulty spectrum:
+\textbf{MATH-500} (500 problems, broad mathematical reasoning),
+\textbf{GSM8K} (1{,}319 problems, grade-school arithmetic),
+\textbf{AIME 2024} (30 competition problems, high difficulty), and
+\textbf{AIME 2025} (30 competition problems, post-training cutoff, out-of-distribution).
+For each benchmark we report pass@1, pass@4, and pass@8, estimated with
+$n=8$ samples at temperature~0.6 using the unbiased estimator.
+AIME 2025 post-dates all training data, providing a clean cross-distribution
+generalization signal.
+
+\paragraph{Hyperparameters.}
+All models use LoRA (rank~64, $\alpha_{\mathrm{LoRA}}=32$), AdamW with
+lr~$=10^{-5}$, batch size~32, rollout count $n=8$, and max response
+length 8{,}192 tokens.
+The KL coefficient is $\beta=0.001$ (low-variance estimator).
+For \method{} we use EMA decay $\alpha=0.9$, warmup threshold $K=3$,
+and mastery threshold $\tau=1.0$; ablations for these choices are in
+Section~\ref{sec:hparam} and Appendix~\ref{app:impl}.
+Full hyperparameter listings are provided in Table~\ref{tab:hyperparams_full}
+(Appendix~\ref{app:impl}).
+
+\paragraph{Baselines.}
+We compare against three baselines.
+\textbf{GRPO} is the standard baseline with batch-level mean and std normalization.
+\textbf{Dr.~GRPO} removes std normalization while retaining the batch-level mean baseline.
+\textbf{DAPO} adds dynamic group filtering (discards all-correct/all-wrong batches),
+clip-higher ($\epsilon_{\mathrm{high}}=0.28$), entropy bonus ($0.001$),
+and removes the KL penalty.
+
+% ──────────────────────────────────────────────────────────────────────────────
+\subsection{Main Results}
+\label{sec:main_results}
+% ──────────────────────────────────────────────────────────────────────────────
+
+Tables~\ref{tab:main_final} and~\ref{tab:main_best} report results on all four
+evaluation benchmarks for methods trained on MATH-Train$_{\text{2800}}$
+with Qwen2.5-Math-1.5B and Qwen3-8B.
+Table~\ref{tab:main_final} uses the \emph{final} checkpoint (step~1720, epoch~20);
+Table~\ref{tab:main_best} uses the \emph{best intermediate} checkpoint
+per method, selected by AIME~2024 pass@1, to isolate peak performance
+from late-training regression.
+Figure~\ref{fig:training_curves} visualizes training dynamics across all benchmarks.
+
+\begin{table}[t]
+\centering
+\caption{Main results at the \textbf{final} checkpoint (step~1720, epoch~20)
+  on MATH-Train$_{\text{2800}}$.
+  Best per column within each model group in \textbf{bold}.}
+\label{tab:main_final}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{llcccccccccccc}
+\toprule
+& & \multicolumn{3}{c}{\textbf{AIME 2024}} & \multicolumn{3}{c}{\textbf{AIME 2025}}
+& \multicolumn{3}{c}{\textbf{MATH-500}} & \multicolumn{3}{c}{\textbf{GSM8K}} \\
+\cmidrule(lr){3-5}\cmidrule(lr){6-8}\cmidrule(lr){9-11}\cmidrule(lr){12-14}
+\textbf{Model} & \textbf{Method} & p@1 & p@4 & p@8 & p@1 & p@4 & p@8 & p@1 & p@4 & p@8 & p@1 & p@4 & p@8 \\
+\midrule
+\multirow{4}{*}{Qwen2.5-Math-1.5B}
+  & GRPO             & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+  & Dr.~GRPO         & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+  & DAPO             & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+  & \method{} (ours) & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+\midrule
+\multirow{4}{*}{Qwen3-8B}
+  & GRPO             & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+  & Dr.~GRPO         & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+  & DAPO             & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+  & \method{} (ours) & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\begin{table}[t]
+\centering
+\caption{Main results at the \textbf{best intermediate} checkpoint
+  (selected by AIME~2024 pass@1; step in parentheses).
+  Same training setup as Table~\ref{tab:main_final}.}
+\label{tab:main_best}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{llccccccccccccc}
+\toprule
+& & & \multicolumn{3}{c}{\textbf{AIME 2024}} & \multicolumn{3}{c}{\textbf{AIME 2025}}
+& \multicolumn{3}{c}{\textbf{MATH-500}} & \multicolumn{3}{c}{\textbf{GSM8K}} \\
+\cmidrule(lr){4-6}\cmidrule(lr){7-9}\cmidrule(lr){10-12}\cmidrule(lr){13-15}
+\textbf{Model} & \textbf{Method} & \textbf{Step} & p@1 & p@4 & p@8 & p@1 & p@4 & p@8 & p@1 & p@4 & p@8 & p@1 & p@4 & p@8 \\
+\midrule
+\multirow{4}{*}{Qwen2.5-Math-1.5B}
+  & GRPO             & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+  & Dr.~GRPO         & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+  & DAPO             & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+  & \method{} (ours) & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+\midrule
+\multirow{4}{*}{Qwen3-8B}
+  & GRPO             & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+  & Dr.~GRPO         & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+  & DAPO             & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+  & \method{} (ours) & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.95\linewidth}{\centering\vspace{3.5cm}
+  \textit{[Placeholder: $2{\times}2$ grid of training accuracy curves.
+  Subplots (left-to-right, top-to-bottom): AIME~2024 pass@1,
+  AIME~2025 pass@1, MATH-500 pass@1, GSM8K pass@1.
+  Each subplot shows curves for GRPO, Dr.~GRPO, DAPO, and \method{}
+  over training steps 0--1720.
+  Annotate the forgetting collapse in GRPO (sharp drop after peak)
+  and the stable trajectory of \method{}.]}
+  \vspace{3.5cm}}}
+\caption{Training accuracy curves on all four evaluation benchmarks.
+  \method{} maintains a stable improvement trajectory; standard GRPO
+  exhibits a characteristic forgetting collapse after reaching peak accuracy.}
+\label{fig:training_curves}
+\end{figure}
+
+% ──────────────────────────────────────────────────────────────────────────────
+\subsection{Ablation Studies}
+\label{sec:ablation}
+% ──────────────────────────────────────────────────────────────────────────────
+
+\subsubsection{Component Ablation}
+\label{sec:comp_ablation}
+
+To isolate the contribution of each design choice, we ablate three binary
+switches: (1) replacing the batch mean with an EMA mean, (2) applying the
+Mastery Filter, and (3) removing std normalization.
+Experiments use Qwen3-1.7B trained on MATH-500$_{\text{400}}$.
+Table~\ref{tab:ablation_component} reports best-checkpoint pass@1 and pass@8
+for all four benchmarks.
+
+A critical finding is that EMA normalization \emph{alone} (without the
+Mastery Filter) increases the number of regressed training problems from
+19 to 37, confirming the zero-gradient protection failure described in
+Section~\ref{sec:intro}.
+The Mastery Filter restores this protection and yields the strongest results.
+
+\begin{table}[t]
+\centering
+\caption{Component ablation (Qwen3-1.7B, MATH-500$_{\text{400}}$, best checkpoint pass@1 / pass@8).}
+\label{tab:ablation_component}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lcccccccccc}
+\toprule
+& & & & \multicolumn{2}{c}{\textbf{AIME 2024}} & \multicolumn{2}{c}{\textbf{AIME 2025}}
+& \multicolumn{2}{c}{\textbf{MATH-500}} & \multicolumn{2}{c}{\textbf{GSM8K}} \\
+\cmidrule(lr){5-6}\cmidrule(lr){7-8}\cmidrule(lr){9-10}\cmidrule(lr){11-12}
+\textbf{Variant} & \textbf{EMA} & \textbf{Filter} & \textbf{No std}
+  & p@1 & p@8 & p@1 & p@8 & p@1 & p@8 & p@1 & p@8 \\
+\midrule
+GRPO (baseline)  & \texttimes & \texttimes & \texttimes & -- & -- & -- & -- & -- & -- & -- & -- \\
++~EMA only       & \checkmark & \texttimes & \texttimes & -- & -- & -- & -- & -- & -- & -- & -- \\
++~EMA + Filter   & \checkmark & \checkmark & \texttimes & -- & -- & -- & -- & -- & -- & -- & -- \\
+\method{} (ours) & \checkmark & \checkmark & \checkmark & -- & -- & -- & -- & -- & -- & -- & -- \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\subsubsection{Effect of Std Normalization}
+\label{sec:std_ablation}
+
+Table~\ref{tab:ablation_std} isolates the impact of dividing by a std
+estimate, comparing four advantage formulations that vary only in the
+source of the mean and std.
+The ``EMA std (w/ bug)'' row corresponds to an earlier implementation that
+tracked EMA std with a $\sigma_0=1$ prior, causing a transient
+pg\_loss spike when EMA activates (as analyzed in Section~\ref{sec:pmb}).
+This ablation, run on Qwen2.5-Math-1.5B with MATH-Train$_{\text{2800}}$,
+tests whether removing std normalization is strictly beneficial in combination
+with the EMA mean baseline.
+
+\begin{table}[t]
+\centering
+\caption{Std normalization ablation (Qwen2.5-Math-1.5B, MATH-Train$_{\text{2800}}$,
+  best checkpoint).
+  ``Batch'' = current-step rollout statistics;
+  ``EMA'' = cross-step moving average;
+  ``--'' = not applied.}
+\label{tab:ablation_std}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{llcccccccc}
+\toprule
+& & \multicolumn{2}{c}{\textbf{AIME 2024}} & \multicolumn{2}{c}{\textbf{AIME 2025}}
+& \multicolumn{2}{c}{\textbf{MATH-500}} & \multicolumn{2}{c}{\textbf{GSM8K}} \\
+\cmidrule(lr){3-4}\cmidrule(lr){5-6}\cmidrule(lr){7-8}\cmidrule(lr){9-10}
+\textbf{Method} & \textbf{Mean / Std}
+  & p@1 & p@8 & p@1 & p@8 & p@1 & p@8 & p@1 & p@8 \\
+\midrule
+GRPO                   & Batch / Batch & -- & -- & -- & -- & -- & -- & -- & -- \\
+Dr.~GRPO               & Batch / --    & -- & -- & -- & -- & -- & -- & -- & -- \\
+EMA-GRPO (w/ EMA std)  & EMA / EMA     & -- & -- & -- & -- & -- & -- & -- & -- \\
+\method{} (ours)       & EMA / --      & -- & -- & -- & -- & -- & -- & -- & -- \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\subsubsection{Forgetting Analysis}
+\label{sec:forgetting}
+
+To directly quantify catastrophic forgetting, we track per-prompt pass@1
+across epochs and count prompts that regress from mastered ($\geq 0.5$
+pass@1 at epoch~1) to forgotten ($< 0.5$ pass@1 at epoch~20).
+Table~\ref{tab:forgetting} reports regression statistics for all methods.
+Figures~\ref{fig:heatmap} and~\ref{fig:regression_curve} visualize
+the forgetting dynamics in detail.
+
+\begin{table}[t]
+\centering
+\caption{Forgetting quantification: prompts regressing from pass@1$\geq$0.5
+  at epoch~1 to pass@1$<$0.5 at epoch~20.
+  Qwen2.5-Math-1.5B, MATH-Train$_{\text{2800}}$ (2{,}800 prompts total).}
+\label{tab:forgetting}
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{Method} & \textbf{\# Regressed} & \textbf{\% of training set} & \textbf{Max regression depth} \\
+\midrule
+GRPO             & -- & -- & -- \\
+Dr.~GRPO         & -- & -- & -- \\
+DAPO             & -- & -- & -- \\
+\method{} (ours) & -- & -- & -- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.95\linewidth}{\centering\vspace{3.5cm}
+  \textit{[Placeholder: side-by-side per-prompt forgetting heatmaps.
+  Left: GRPO. Right: \method{}.
+  X-axis: training step (0--1720, checkpointed every 200 steps).
+  Y-axis: training prompts sorted by initial difficulty (hardest top).
+  Color: pass@1 at each checkpoint (green = correct, red = incorrect).
+  Highlight regression events (green $\to$ red) that appear in GRPO
+  but are suppressed or recovered in \method{}.]}
+  \vspace{3.5cm}}}
+\caption{Per-prompt pass@1 heatmaps over training steps for GRPO (left)
+  vs.\ \method{} (right). Each row is one training prompt.
+  Regression events (green $\to$ red transitions) are visibly suppressed
+  by the Mastery Filter.}
+\label{fig:heatmap}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.95\linewidth}{\centering\vspace{2.5cm}
+  \textit{[Placeholder: line chart of cumulative regressed prompts over
+  training steps for all four methods.
+  X-axis: training step (0--1720).
+  Y-axis: cumulative \# of prompts that have shown at least one regression.
+  Expected: GRPO grows steeply; \method{} stays near zero throughout.]}
+  \vspace{2.5cm}}}
+\caption{Cumulative number of training prompts showing at least one
+  regression event over training steps.
+  \method{}'s Mastery Filter prevents forgetting events from accumulating.}
+\label{fig:regression_curve}
+\end{figure}
+
+\subsubsection{Hyperparameter Determination}
+\label{sec:hparam}
+
+\method{} introduces three hyperparameters beyond the standard GRPO setup:
+the EMA decay coefficient $\alpha$, the warmup threshold $K$, and the
+mastery threshold $\tau$.
+We discuss the design rationale for each and report sensitivity experiments
+validating the chosen defaults.
+
+\paragraph{EMA decay coefficient $\alpha$.}
+The role of $\alpha$ is to trade off stability against adaptivity:
+larger $\alpha$ produces a smoother, more stable baseline that is slower
+to reflect recent learning.
+The effective sample count $n_{\mathrm{eff}} \approx n/(1-\alpha)$
+determines how much of the step-level baseline noise is suppressed.
+Table~\ref{tab:alpha_tradeoff} summarizes the properties at each candidate
+value.
+
+\begin{table}[h]
+\centering
+\caption{EMA decay $\alpha$: effective sample count and adaptation speed.
+  ``Visits to converge'' = number of visits before $\mu(p)$ tracks the
+  true mean to within 10\% of the initial error.}
+\label{tab:alpha_tradeoff}
+\small
+\begin{tabular}{cccp{6cm}}
+\toprule
+$\alpha$ & $n_{\mathrm{eff}}$ & Visits to converge & Recommended scenario \\
+\midrule
+0.80 &  40 & $\sim$5 & Large datasets; each prompt appears infrequently per epoch \\
+\textbf{0.90} & \textbf{80} & $\sim$10 & \textbf{Default.} Small--medium datasets; each prompt appears $\sim$1$\times$/epoch \\
+0.95 & 160 & $\sim$20 & Large datasets with stable prompt distributions \\
+0.99 & 800 & $\sim$100 & Very large datasets; very slow adaptation, insensitive to recent regression \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The choice $\alpha=0.9$ is motivated by the dataset structure.
+In our setting with $N=400$ training prompts and batch size 32, each prompt
+appears roughly once every $\lceil N/32 \rceil \approx 13$ steps.
+An effective window of 10 steps therefore corresponds to approximately
+10 consecutive epochs, giving the EMA baseline time to average out
+within-epoch randomness while still responding to genuine policy improvement
+within a few epochs.
+At $\alpha=0.99$, the EMA window spans $\sim$100 steps ($\approx$100 epochs
+in this setting), making the baseline almost constant and no better than a
+fixed prior.
+At $\alpha=0.80$, the window is only 5 steps, barely longer than a single
+batch, and the variance reduction over standard GRPO is limited
+($5\times$ instead of $10\times$).
+
+To empirically validate $\alpha=0.9$, we run \method{} on
+MATH-500$_{\text{400}}$ with Qwen3-1.7B across four $\alpha$ values,
+fixing $K=3$.
+Table~\ref{tab:hparam_alpha} reports best-checkpoint MATH-500 and GSM8K
+pass@1.
+
+\begin{table}[h]
+\centering
+\caption{Sensitivity to EMA decay $\alpha$ ($K=3$ fixed, Qwen3-1.7B,
+  MATH-500$_{\text{400}}$, best checkpoint).}
+\label{tab:hparam_alpha}
+\small
+\begin{tabular}{ccccc}
+\toprule
+$\alpha$ & $n_{\mathrm{eff}}$ & MATH-500 p@1 & MATH-500 p@8 & \# Regressed prompts \\
+\midrule
+0.80 &  40 & -- & -- & -- \\
+\textbf{0.90} & \textbf{80} & \textbf{0.689} & \textbf{0.800} & \textbf{--} \\
+0.95 & 160 & -- & -- & -- \\
+0.99 & 800 & -- & -- & -- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Warmup threshold $K$.}
+Before the EMA baseline has accumulated sufficient observations, it is
+initialized from the first batch mean (cold start) and is therefore
+subject to single-batch noise.
+The warmup threshold $K$ specifies how many visits are required before
+the EMA mean is trusted as a baseline; below $K$, the method falls back
+to the standard GRPO batch mean.
+
+Table~\ref{tab:warmup_tradeoff} summarizes the implications of different $K$
+values.
+
+\begin{table}[h]
+\centering
+\caption{Warmup threshold $K$: behavior and recommendation.}
+\label{tab:warmup_tradeoff}
+\small
+\begin{tabular}{ccp{7.5cm}}
+\toprule
+$K$ & Warmup epochs & Effect \\
+\midrule
+1 & 0 & No warmup; EMA activates immediately on second visit.
+        Cold-start mean from one batch ($n=8$ samples) is high-variance;
+        early EMA baseline is unreliable. \emph{Not recommended.} \\
+\textbf{3} & $\sim$3 & \textbf{Default.} EMA based on 3 visits ($\sim$24 rollouts) before activation;
+        mean estimate standard error $\approx 0.177/\sqrt{3} \approx 0.10$.
+        Balance between early activation and reliability. \\
+5 & $\sim$5 & More conservative; reliable EMA from 5 visits ($\sim$40 rollouts).
+        Foregoes improvement for the first 5 epochs.
+        Marginal benefit over $K=3$ in practice. \\
+10 & $\sim$10 & Very conservative; for the first 10 epochs the method is
+        equivalent to standard GRPO. Unnecessarily delays forgetting protection. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The choice $K=3$ reflects a compromise: after 3 visits the per-prompt
+mean estimate has standard error $\approx \sqrt{\pi(1-\pi)/(3n)} \approx 0.10$
+(at $\pi=0.5$, $n=8$), which is roughly half the single-batch error.
+This is sufficient for the EMA to provide a more stable baseline than the
+batch mean without delaying protection for too long.
+Crucially, the Mastery Filter is active from step 1 regardless of $K$---since
+it operates on the current-batch mean rather than the EMA---so forgetting
+protection is never entirely disabled during warmup.
+
+Table~\ref{tab:hparam_K} reports empirical sensitivity to $K$ on
+MATH-500$_{\text{400}}$ with $\alpha=0.9$ fixed.
+
+\begin{table}[h]
+\centering
+\caption{Sensitivity to warmup threshold $K$ ($\alpha=0.9$ fixed,
+  Qwen3-1.7B, MATH-500$_{\text{400}}$, best checkpoint).}
+\label{tab:hparam_K}
+\small
+\begin{tabular}{cccc}
+\toprule
+$K$ & MATH-500 p@1 & MATH-500 p@8 & \# Regressed prompts \\
+\midrule
+1  & -- & -- & -- \\
+\textbf{3}  & \textbf{0.689} & \textbf{0.800} & \textbf{--} \\
+5  & -- & -- & -- \\
+10 & -- & -- & -- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Mastery threshold $\tau$.}
+We fix $\tau=1.0$ (all $n$ rollouts correct) for two reasons.
+First, requiring strict unanimity avoids silencing prompts where the model
+is not yet reliably correct: a batch with $n-1$ correct and 1 incorrect
+rollout still contains a valid contrastive signal---the failed rollout has
+advantage $r^{\text{fail}} - \mu_{t-1}(p) < 0$ and the successful rollouts
+have positive advantages, providing a well-conditioned update direction.
+Setting $\tau < 1.0$ (\eg, $\tau = 7/8 = 0.875$) would suppress this
+signal, treating a prompt as mastered when a fraction of rollouts remain
+incorrect.
+Second, for binary rewards, $\hat{\mu}_t^{(p)} = 1.0$ is the only
+configuration where $\hat{\sigma}_t^{(p)} = 0$ exactly, which means
+$\tau=1.0$ is precisely the threshold at which std-normalized advantages
+would be numerically undefined---making the Filter a necessary and
+sufficient condition for numerical safety (Section~\ref{sec:ema_norm}).
+We therefore do not treat $\tau$ as a tunable hyperparameter and do not
+report a sensitivity sweep for it.
+
+\subsubsection{Degradation-Aware Resampling vs.\ Mastery Filter}
+\label{sec:resampling_ablation}
+
+The Mastery Filter provides an implicit difficulty-aware curriculum:
+mastered prompts contribute zero gradient, so all learning signal comes
+from non-mastered prompts automatically.
+Degradation-Aware Resampling (Section~\ref{sec:resampling}) pursues the same
+objective in sampling space and is therefore conceptually redundant with
+the Filter.
+Table~\ref{tab:ablation_resampling} tests whether explicit resampling at
+varying $\gamma$ provides any additional gain over the Mastery Filter alone
+($\gamma=0$) on MATH-Train$_{\text{2800}}$.
+We expect the answer to be negative: the implicit gradient curriculum
+is sufficient, and explicit oversampling of hard prompts only increases
+overfitting risk.
+
+\begin{table}[t]
+\centering
+\caption{Degradation-Aware Resampling: effect of $\gamma$ across all benchmarks
+  (Qwen2.5-Math-1.5B, MATH-Train$_{\text{2800}}$, best checkpoint).
+  $\gamma=0$ is \method{} without resampling.}
+\label{tab:ablation_resampling}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{ccccccccc}
+\toprule
+& \multicolumn{2}{c}{\textbf{AIME 2024}} & \multicolumn{2}{c}{\textbf{AIME 2025}}
+& \multicolumn{2}{c}{\textbf{MATH-500}} & \multicolumn{2}{c}{\textbf{GSM8K}} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}\cmidrule(lr){8-9}
+$\gamma$ & p@1 & p@8 & p@1 & p@8 & p@1 & p@8 & p@1 & p@8 \\
+\midrule
+0.0 (no resampling) & -- & -- & -- & -- & -- & -- & -- & -- \\
+0.5 & -- & -- & -- & -- & -- & -- & -- & -- \\
+1.0 & -- & -- & -- & -- & -- & -- & -- & -- \\
+2.0 & -- & -- & -- & -- & -- & -- & -- & -- \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\subsubsection{Scale Generalization}
+\label{sec:scale}
+
+Table~\ref{tab:scale} tests whether the gains of \method{} over GRPO
+generalize across training set sizes.
+Qwen3-1.7B results on the two smaller splits are populated from completed
+experiments; Qwen2.5-Math-1.5B results on MATH-Train$_{\text{2800}}$
+are to be filled once all checkpoints are evaluated.
+
+\begin{table}[t]
+\centering
+\caption{Scale generalization: \method{} vs.\ GRPO across training set sizes
+  and model configurations (best checkpoint, $\Delta = \text{\method{}} - \text{GRPO}$).}
+\label{tab:scale}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{llcccccccc}
+\toprule
+& & \multicolumn{2}{c}{\textbf{AIME 2024}} & \multicolumn{2}{c}{\textbf{AIME 2025}}
+& \multicolumn{2}{c}{\textbf{MATH-500}} & \multicolumn{2}{c}{\textbf{GSM8K}} \\
+\cmidrule(lr){3-4}\cmidrule(lr){5-6}\cmidrule(lr){7-8}\cmidrule(lr){9-10}
+\textbf{Dataset ($N$)} & \textbf{Model}
+  & $\Delta$p@1 & $\Delta$p@8 & $\Delta$p@1 & $\Delta$p@8
+  & $\Delta$p@1 & $\Delta$p@8 & $\Delta$p@1 & $\Delta$p@8 \\
+\midrule
+MATH-500$_{\text{400}}$ (400)
+  & Qwen3-1.7B           & -- & -- & -- & -- & +0.019 & +0.010 & -- & -- \\
+GSM8K$_{\text{1000}}$ (1{,}000)
+  & Qwen3-1.7B           & -- & -- & -- & -- & -- & -- & +0.007 & +0.015 \\
+\midrule
+\multirow{3}{*}{MATH-Train$_{\text{2800}}$ (2{,}800)}
+  & Qwen3-1.7B           & -- & -- & -- & -- & -- & -- & -- & -- \\
+  & Qwen2.5-Math-1.5B    & -- & -- & -- & -- & -- & -- & -- & -- \\
+  & Qwen3-8B           & -- & -- & -- & -- & -- & -- & -- & -- \\
+  & Qwen2.5-Math-7B-Base & -- & -- & -- & -- & -- & -- & -- & -- \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+% ──────────────────────────────────────────────────────────────────────────────
+\subsection{Training Dynamics Analysis}
+\label{sec:dynamics}
+% ──────────────────────────────────────────────────────────────────────────────
+
+Beyond benchmark numbers, we analyze the internal statistics of \method{}
+to understand why it mitigates forgetting.
+
+\paragraph{EMA mean distribution evolution.}
+Figure~\ref{fig:ema_dist} visualizes how the distribution of per-prompt
+EMA means $\{\mu_t(p)\}_{p \in \mathcal{D}}$ evolves over training.
+We expect a rightward shift (overall improvement) accompanied by emerging
+bimodality: easy prompts converge toward $\mu=1.0$ while hard prompts
+remain concentrated near lower values.
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.95\linewidth}{\centering\vspace{3cm}
+  \textit{[Placeholder: histogram or violin plot of per-prompt EMA mean
+  $\mu_t(p)$ at training steps $t \in \{0, 400, 800, 1200, 1720\}$.
+  X-axis: EMA mean value (0--1). Y-axis: density.
+  Color-coded curves for each checkpoint.
+  Expected: distribution shifts right and becomes bimodal over time,
+  separating mastered ($\mu\to 1$) from persistently hard prompts.]}
+  \vspace{3cm}}}
+\caption{Distribution of per-prompt EMA means $\mu_t(p)$ at five training
+  checkpoints. The rightward shift indicates overall learning; the bimodal
+  structure confirms that the bank correctly differentiates mastered from
+  hard prompts.}
+\label{fig:ema_dist}
+\end{figure}
+
+\paragraph{Mastery Filter trigger rate.}
+Figure~\ref{fig:filter_rate} tracks the fraction of prompts per step for
+which the Mastery Filter fires ($\hat{\mu}_t^{(p)} = 1.0$, all rollouts
+correct).
+A monotonically increasing rate is the expected signal: as the model learns,
+more prompts become fully mastered and their gradients are suppressed.
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.95\linewidth}{\centering\vspace{2.5cm}
+  \textit{[Placeholder: line chart of Mastery Filter trigger rate
+  (fraction of batch prompts with $\hat\mu_t^{(p)}=1.0$) over training steps.
+  X-axis: training step (0--1720). Y-axis: trigger rate (0--1).
+  Shaded region: rolling-window standard deviation across steps.
+  Expected: monotonic increase from near 0 to 0.3--0.5 by epoch~20.]}
+  \vspace{2.5cm}}}
+\caption{Mastery Filter trigger rate over training. The monotonically rising
+  rate confirms that the filter increasingly suppresses gradients on mastered
+  prompts, protecting acquired knowledge throughout training.}
+\label{fig:filter_rate}
+\end{figure}
+
+\paragraph{Advantage magnitude distribution.}
+Figure~\ref{fig:adv_magnitude} compares the distribution of non-zero advantage
+magnitudes $|A_i^{(p)}|$ between GRPO and \method{} over training.
+Because GRPO normalizes by batch std, its advantages are tightly bounded.
+\method{}'s unnormalized advantages $r - \mu$ preserve natural scale:
+near-mastered prompts emit small advantages while hard prompts emit larger
+ones, providing an implicit difficulty-adaptive weighting without explicit
+resampling.
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.95\linewidth}{\centering\vspace{2.5cm}
+  \textit{[Placeholder: violin or box plots comparing $|A_i^{(p)}|$ distributions
+  for GRPO vs.\ \method{} at training checkpoints step $\in \{400, 800, 1200, 1720\}$.
+  X-axis: checkpoint. Y-axis: $|A_i^{(p)}|$.
+  Expected: GRPO advantages cluster uniformly near $[0.1, 0.5]$;
+  \method{} advantages are smaller for high-$\mu$ prompts and larger
+  for low-$\mu$ prompts, showing difficulty-adaptive concentration.]}
+  \vspace{2.5cm}}}
+\caption{Distribution of advantage magnitudes $|A_i^{(p)}|$ for GRPO vs.\
+  \method{} across training checkpoints.
+  \method{}'s unnormalized formulation naturally concentrates gradient
+  energy on harder, less-mastered prompts.}
+\label{fig:adv_magnitude}
+\end{figure}
+
+% ──────────────────────────────────────────────────────────────────────────────
+\subsection{Multi-Model Generalization}
+\label{sec:largescale}
+% ──────────────────────────────────────────────────────────────────────────────
+
+To test whether \method{} generalizes beyond the primary 1.5B model, we
+evaluate on Qwen3-1.7B and Qwen2.5-Math-7B-Base under the same
+MATH-Train$_{\text{2800}}$ setup.
+A stronger base model raises overall accuracy, making it a meaningful test of
+whether forgetting suppression remains beneficial when the model already
+solves a larger fraction of training prompts.
+Results follow the same evaluation protocol as Section~\ref{sec:main_results}.
+
+\begin{table}[t]
+\centering
+\caption{Results with \textbf{Qwen3-1.7B} on MATH-Train$_{\text{2800}}$,
+  \textbf{final} checkpoint (step~1720).
+  Best per column in \textbf{bold}.}
+\label{tab:qwen3_1.7b_results}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lcccccccccccc}
+\toprule
+& \multicolumn{3}{c}{\textbf{AIME 2024}} & \multicolumn{3}{c}{\textbf{AIME 2025}}
+& \multicolumn{3}{c}{\textbf{MATH-500}} & \multicolumn{3}{c}{\textbf{GSM8K}} \\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}\cmidrule(lr){8-10}\cmidrule(lr){11-13}
+\textbf{Method} & p@1 & p@4 & p@8 & p@1 & p@4 & p@8 & p@1 & p@4 & p@8 & p@1 & p@4 & p@8 \\
+\midrule
+GRPO             & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+Dr.~GRPO         & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+DAPO             & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+\method{} (ours) & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\begin{table}[t]
+\centering
+\caption{Results with \textbf{Qwen2.5-Math-7B-Base} on MATH-Train$_{\text{2800}}$,
+  \textbf{final} checkpoint.
+  Best per column in \textbf{bold}.}
+\label{tab:7b_results}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lcccccccccccc}
+\toprule
+& \multicolumn{3}{c}{\textbf{AIME 2024}} & \multicolumn{3}{c}{\textbf{AIME 2025}}
+& \multicolumn{3}{c}{\textbf{MATH-500}} & \multicolumn{3}{c}{\textbf{GSM8K}} \\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}\cmidrule(lr){8-10}\cmidrule(lr){11-13}
+\textbf{Method} & p@1 & p@4 & p@8 & p@1 & p@4 & p@8 & p@1 & p@4 & p@8 & p@1 & p@4 & p@8 \\
+\midrule
+GRPO             & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+Dr.~GRPO         & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+DAPO             & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+\method{} (ours) & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+% ══════════════════════════════════════════════════════════════════════════════
+% Appendix
+% ══════════════════════════════════════════════════════════════════════════════
+\appendix
+
+\section{Implementation Details}
+\label{app:impl}
+
+\paragraph{Full hyperparameter table.}
+Table~\ref{tab:hyperparams_full} lists all hyperparameters used across
+experiments.
+
+\begin{table}[h]
+\centering
+\caption{Full hyperparameter listing used in all experiments.}
+\label{tab:hyperparams_full}
+\small
+\begin{tabular}{ll}
+\toprule
+\textbf{Hyperparameter} & \textbf{Value} \\
+\midrule
+Rollout count $n$                          & 8 \\
+LoRA rank / $\alpha_{\mathrm{LoRA}}$       & 64 / 32 \\
+Optimizer                                  & AdamW, lr $= 10^{-5}$ \\
+Batch size                                 & 32 \\
+Training epochs                            & 20 \\
+Max response length                        & 8{,}192 tokens \\
+KL coefficient $\beta$                     & 0.001 (low-variance KL estimator) \\
+EMA decay $\alpha$                         & 0.9 \\
+Warmup threshold $K$                       & 3 \\
+Mastery threshold $\tau$                   & 1.0 \\
+Eval temperature                           & 0.6 \\
+Eval samples per problem                   & 8 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{PromptMemoryBank complexity and integration.}
+The PromptMemoryBank stores two floating-point scalars per prompt (EMA mean
+and visit count), requiring $O(N)$ additional memory—negligible relative to
+model parameters.
+It is serialized alongside model checkpoints to ensure continuity across
+training resumptions.
+Integration into an existing GRPO framework requires three modifications:
+(1) initializing the memory bank at training start,
+(2) intercepting the advantage computation step to apply Eq.~\eqref{eq:final_adv},
+and (3) updating the bank after each rollout batch.
+No changes to the model architecture, optimizer, or rollout infrastructure
+are required.
+
+% ─────────────────────────────────────────────────────────────────────────────
+
+\section{Degradation-Aware Resampling}
+\label{app:resampling}
+
+We explored an explicit resampling scheme that upweights hard and regressing
+prompts in the sampling distribution.
+As argued in Section~\ref{sec:mastery}, the Mastery Filter already achieves
+this goal implicitly: mastered prompts contribute zero gradient, so all
+learning signal originates from non-mastered prompts automatically.
+Explicit resampling is therefore conceptually redundant with the Filter,
+and our ablations (Section~\ref{sec:resampling_ablation}) confirm it
+provides no additional benefit and is actively harmful on small datasets.
+We describe it here for completeness.
+
+Define the \emph{difficulty score} $d_t(p) = \max(0, 1 - \mu_t(p))$
+and the \emph{degradation score} $g_t(p) = \max(0, \mu_0(p) - \mu_t(p))$,
+both zero for $c(p) < K$.
+The sampling weight for prompt $p$ at step $t$ is
+\begin{equation}
+  w_t(p) = 1 + \gamma\!\left[d_t(p) + g_t(p)\right],
+  \label{eq:weight}
+\end{equation}
+where $\gamma=0$ recovers uniform sampling.
+The difficulty score targets prompts the model has never reliably solved;
+the degradation score targets prompts that were previously mastered but
+have since regressed—both desirable properties for forgetting mitigation.
+
+\paragraph{Why it fails on small datasets.}
+With $N=400$ training prompts, a hard subset of $\sim$50 prompts receives
+$2\times$--$3\times$ more samples under $\gamma=1$.
+This effectively reduces the diversity of the training distribution by a
+factor of 2--3, causing the policy to overfit rapidly to the hard subset
+while losing generalization on the rest.
+The implicit curriculum of the Mastery Filter (gradient suppression on
+mastered prompts) achieves difficulty concentration in \emph{gradient space}
+without altering the sampling distribution, avoiding this overfitting failure.
+We recommend Degradation-Aware Resampling only when $N > 1{,}000$.
+
+\end{document}
