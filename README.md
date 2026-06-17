@@ -29,37 +29,27 @@ On MATH-500 with Qwen3-1.7B:
 ## Repository Structure
 
 ```
-verl/                                    # Modified verl framework source (for reproduction)
-├── verl/trainer/ppo/core_algos.py       # EMA_GRPO advantage estimator
-├── verl/trainer/ppo/ray_trainer.py      # Memory bank lifecycle & pre-init
-├── verl/trainer/config/algorithm.py     # AlgoConfig with EMA-GRPO fields
-├── verl/trainer/config/ppo_trainer.yaml # Default YAML config
-├── verl/trainer/main_ppo.py             # Training entry point
-├── verl/utils/prompt_memory_bank.py     # Core: per-prompt EMA statistics bank
-├── verl/experimental/dataset/
-│   ├── sampler.py                       # AbstractCurriculumSampler interface
-│   └── degradation_sampler.py           # Degradation-aware replay sampling
-└── examples/
-    ├── data_preprocess/                 # Dataset preparation scripts
-    └── grpo_trainer/                    # Example training scripts
+verl/verl/                               # Modified verl framework source (for reproduction)
+├── trainer/ppo/core_algos.py            #   EMA_GRPO advantage estimator
+├── trainer/ppo/ray_trainer.py           #   Memory bank lifecycle & pre-init
+├── trainer/config/algorithm.py          #   AlgoConfig with EMA-GRPO fields
+├── trainer/config/ppo_trainer.yaml      #   Default YAML config
+├── trainer/main_ppo.py                  #   Training entry point
+├── utils/prompt_memory_bank.py          #   Core: per-prompt EMA statistics bank
+└── experimental/dataset/
+    ├── sampler.py                       #   AbstractCurriculumSampler interface
+    └── degradation_sampler.py           #   Degradation-aware replay sampling (optional)
 
-src/                                     # Standalone copies (for quick reference)
-├── prompt_memory_bank.py
-└── degradation_sampler.py
+scripts/
+├── train_example.sh                     # Full training script (GRPO baseline + EMA-GRPO)
+└── eval_example.sh                      # Evaluation script
 
-tools/                                   # Utilities
-├── precompute_memory_bank.py            # Pre-init memory bank with base model
-├── eval_passk_final.py                  # Pass@k evaluation with vLLM
-├── compare_experiments.py               # Cross-experiment comparison
-├── merge_lora_direct.py                 # LoRA merge utility
-└── ...
+tools/
+├── precompute_memory_bank.py            # Offline memory bank pre-initialization
+└── eval_passk_final.py                  # Pass@k evaluation with vLLM
 
-run_*.sh                                 # Training scripts (various models/configs)
-eval_*.sh                                # Evaluation scripts
-eval_results/                            # Experiment results (JSON)
-reports/                                 # Detailed experiment reports
-fig_data/                                # Training curves and visualization data
 paper.tex                                # Paper draft
+verl_modifications_current.md            # Detailed integration documentation
 ```
 
 ## Reproduction
@@ -67,25 +57,14 @@ paper.tex                                # Paper draft
 ### Prerequisites
 
 1. Install [verl](https://github.com/volcengine/verl) framework
-2. Replace/patch the files in `verl/` directory into your verl installation:
+2. Patch the modified files into your verl installation:
    ```bash
-   # Option A: Copy modified files over your verl installation
    cp -r verl/verl/* /path/to/your/verl/verl/
-   
-   # Option B: Or simply use this repo as the verl source
-   cd verl && pip install -e .
    ```
 3. Prepare dataset with `index` field in `extra_info`:
    ```python
    # Each row's extra_info must contain: {"index": <int>, "split": "train"}
-   python verl/examples/data_preprocess/math_dataset.py
    ```
-
-### Quick Start
-
-MemPO is implemented as a modification to the [verl](https://github.com/volcengine/verl) framework. The complete modified source is in the `verl/` directory.
-
-See [verl_modifications_current.md](verl_modifications_current.md) for detailed integration documentation.
 
 ### Training
 
@@ -96,6 +75,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.n=8 \
     ...
 ```
+
+See `scripts/train_example.sh` for a complete training command, and [verl_modifications_current.md](verl_modifications_current.md) for full integration details.
 
 ### Key Hyperparameters
 
@@ -112,9 +93,7 @@ python3 -m verl.trainer.main_ppo \
 
 ### Dynamic Alpha (Parameter-Free)
 
-The EMA smoothing factor adapts automatically based on how much the policy has changed:
-
-| Scenario | δ = |μ̂_t - μ_{t-1}| | α | Interpretation |
+| Scenario | δ = \|μ̂_t - μ_{t-1}\| | α | Interpretation |
 |----------|-------------------|---|----------------|
 | Large policy shift | δ → 1 | α → 1/n | Trust current batch (baseline is stale) |
 | Stable policy | δ → 0 | α → (n-1)/n | Trust history (smooth baseline) |
