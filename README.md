@@ -2,6 +2,8 @@
 
 **Mitigating Catastrophic Forgetting in GRPO via Cross-Step EMA Normalization and Mastery Filtering**
 
+![MemPO Overview](assets/mempo_overview.png)
+
 ## Overview
 
 MemPO (Memory-augmented Policy Optimization, internally developed as EMA-GRPO) addresses a critical failure mode in Group Relative Policy Optimization (GRPO): **catastrophic forgetting of mastered problems during extended reinforcement learning training**.
